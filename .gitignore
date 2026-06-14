@@ -161,6 +161,9 @@ venv.bak/
 config.json
 config.local.json
 
+# Generated registration results with login cookies
+????.??.??_??.??_*.txt
+
 # IDE / editor settings
 .idea/
 
