@@ -21,6 +21,7 @@ import random
 import re
 import string
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
@@ -43,6 +44,7 @@ DEFAULT_CONFIG = {
     "proxy": "http://127.0.0.1:7890",
     "enable_nsfw": True,
     "register_count": 1,
+    "concurrent_workers": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
 }
 
@@ -142,6 +144,15 @@ EXTENSION_PATH = os.path.abspath(
 )
 if os.path.exists(EXTENSION_PATH):
     co.add_extension(EXTENSION_PATH)
+
+
+def build_chromium_options():
+    options = ChromiumOptions()
+    options.auto_port()
+    options.set_timeouts(base=1)
+    if os.path.exists(EXTENSION_PATH):
+        options.add_extension(EXTENSION_PATH)
+    return options
 
 
 DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
@@ -895,48 +906,83 @@ def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
 # ===================== 浏览器自动化 (来自 DrissionPage_example.py) =====================
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
-browser = None
-page = None
+_browser_context = threading.local()
+
+
+class ThreadLocalBrowserRef:
+    def __init__(self, attr_name):
+        self.attr_name = attr_name
+
+    def _target(self):
+        target = getattr(_browser_context, self.attr_name, None)
+        if target is None:
+            raise RuntimeError(f"{self.attr_name} is not initialized in this thread")
+        return target
+
+    def __getattr__(self, name):
+        return getattr(self._target(), name)
+
+    def __bool__(self):
+        return getattr(_browser_context, self.attr_name, None) is not None
+
+
+browser = ThreadLocalBrowserRef("browser")
+page = ThreadLocalBrowserRef("page")
+
+
+def get_thread_browser():
+    return getattr(_browser_context, "browser", None)
+
+
+def get_thread_page():
+    return getattr(_browser_context, "page", None)
+
+
+def set_thread_browser(browser_obj=None, page_obj=None):
+    _browser_context.browser = browser_obj
+    _browser_context.page = page_obj
 
 
 def start_browser():
-    global browser, page
-    browser = Chromium(co)
-    tabs = browser.get_tabs()
-    page = tabs[-1] if tabs else browser.new_tab()
-    return browser, page
+    browser_obj = Chromium(build_chromium_options())
+    tabs = browser_obj.get_tabs()
+    page_obj = tabs[-1] if tabs else browser_obj.new_tab()
+    set_thread_browser(browser_obj, page_obj)
+    return browser_obj, page_obj
 
 
 def stop_browser():
-    global browser, page
-    if browser is not None:
+    browser_obj = get_thread_browser()
+    if browser_obj is not None:
         try:
-            browser.quit()
+            browser_obj.quit()
         except Exception:
             pass
-    browser = None
-    page = None
+    set_thread_browser(None, None)
 
 
 def restart_browser():
-    global browser, page
-    if browser is not None:
+    browser_obj = get_thread_browser()
+    if browser_obj is not None:
         try:
-            browser.quit()
+            browser_obj.quit()
         except Exception:
             pass
-    browser = Chromium(co)
-    tabs = browser.get_tabs()
-    page = tabs[-1] if tabs else browser.new_tab()
+    browser_obj = Chromium(build_chromium_options())
+    tabs = browser_obj.get_tabs()
+    page_obj = tabs[-1] if tabs else browser_obj.new_tab()
+    set_thread_browser(browser_obj, page_obj)
+    return browser_obj, page_obj
 
 
 def clear_login_state(log_callback=None):
-    global browser, page
+    browser_obj = get_thread_browser()
+    page_obj = get_thread_page()
     try:
-        if browser is not None:
-            browser.clear_cache(cache=False, cookies=True)
-        if page is not None:
-            page.run_js(
+        if browser_obj is not None:
+            browser_obj.clear_cache(cache=False, cookies=True)
+        if page_obj is not None:
+            page_obj.run_js(
                 """
 try { localStorage.clear(); } catch (e) {}
 try { sessionStorage.clear(); } catch (e) {}
@@ -950,22 +996,24 @@ try { sessionStorage.clear(); } catch (e) {}
 
 
 def refresh_active_page():
-    global browser, page
-    if browser is None:
+    browser_obj = get_thread_browser()
+    if browser_obj is None:
         restart_browser()
+        browser_obj = get_thread_browser()
     try:
-        tabs = browser.get_tabs()
+        tabs = browser_obj.get_tabs()
         if tabs:
-            page = tabs[-1]
+            page_obj = tabs[-1]
         else:
-            page = browser.new_tab()
+            page_obj = browser_obj.new_tab()
+        set_thread_browser(browser_obj, page_obj)
     except Exception:
         restart_browser()
-    return page
+        page_obj = get_thread_page()
+    return page_obj
 
 
 def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
-    global page
     deadline = time.time() + timeout
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -1007,12 +1055,12 @@ return true;
 
 
 def open_signup_page(log_callback=None, cancel_callback=None):
-    global browser, page
-
     raise_if_cancelled(cancel_callback)
 
-    if browser is None:
+    browser_obj = get_thread_browser()
+    if browser_obj is None:
         start_browser()
+        browser_obj = get_thread_browser()
         if log_callback:
             log_callback("[*] 浏览器已启动")
 
@@ -1032,6 +1080,7 @@ def open_signup_page(log_callback=None, cancel_callback=None):
             restart_browser()
             page = browser.new_tab(SIGNUP_URL)
 
+    set_thread_browser(get_thread_browser(), page)
     page.wait.doc_loaded()
     sleep_with_cancel(2, cancel_callback)
 
@@ -1762,10 +1811,12 @@ def get_current_sso_cookie():
     try:
         refresh_active_page()
         cookie_sources = []
-        if browser is not None:
-            cookie_sources.append(browser.cookies(all_info=True) or [])
-        if page is not None:
-            cookie_sources.append(page.cookies(all_domains=True, all_info=True) or [])
+        browser_obj = get_thread_browser()
+        page_obj = get_thread_page()
+        if browser_obj is not None:
+            cookie_sources.append(browser_obj.cookies(all_info=True) or [])
+        if page_obj is not None:
+            cookie_sources.append(page_obj.cookies(all_domains=True, all_info=True) or [])
         for cookies in cookie_sources:
             for item in cookies:
                 if isinstance(item, dict):
@@ -1783,14 +1834,16 @@ def get_current_sso_cookie():
 
 def iter_cookie_items():
     cookie_sources = []
-    if browser is not None:
+    browser_obj = get_thread_browser()
+    page_obj = get_thread_page()
+    if browser_obj is not None:
         try:
-            cookie_sources.append(browser.cookies(all_info=True) or [])
+            cookie_sources.append(browser_obj.cookies(all_info=True) or [])
         except Exception:
             pass
-    if page is not None:
+    if page_obj is not None:
         try:
-            cookie_sources.append(page.cookies(all_domains=True, all_info=True) or [])
+            cookie_sources.append(page_obj.cookies(all_domains=True, all_info=True) or [])
         except Exception:
             pass
     for cookies in cookie_sources:
@@ -1816,7 +1869,7 @@ def wait_for_sso_cookie(
         raise_if_cancelled(cancel_callback)
         try:
             refresh_active_page()
-            if page is None:
+            if get_thread_page() is None:
                 sleep_with_cancel(1, cancel_callback)
                 continue
 
@@ -1855,6 +1908,7 @@ class GrokRegisterGUI:
         self.results = []
         self.stop_requested = False
         self.ui_queue = queue.Queue()
+        self.state_lock = threading.Lock()
 
         self.setup_ui()
 
@@ -1894,6 +1948,17 @@ class GrokRegisterGUI:
             config_frame, text="注册后开启NSFW", variable=self.nsfw_var
         )
         self.nsfw_check.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=5)
+
+        ttk.Label(config_frame, text="并发线程数:").grid(
+            row=1, column=2, sticky=tk.W, padx=10
+        )
+        self.concurrent_var = tk.StringVar(
+            value=str(config.get("concurrent_workers", 1))
+        )
+        self.concurrent_spinbox = ttk.Spinbox(
+            config_frame, from_=1, to=10, width=8, textvariable=self.concurrent_var
+        )
+        self.concurrent_spinbox.grid(row=1, column=3, sticky=tk.W, padx=5)
 
         ttk.Label(config_frame, text="代理 (可选):").grid(row=2, column=0, sticky=tk.W)
         self.proxy_var = tk.StringVar(value=config.get("proxy", ""))
@@ -2102,7 +2167,16 @@ class GrokRegisterGUI:
             messagebox.showerror("错误", "请输入有效的注册数量")
             return
 
+        try:
+            concurrent_workers = int(self.concurrent_var.get())
+        except ValueError:
+            messagebox.showerror("错误", "请输入有效的并发线程数")
+            return
+
+        concurrent_workers = max(1, min(concurrent_workers, count, 10))
+
         config["register_count"] = count
+        config["concurrent_workers"] = concurrent_workers
         config["proxy"] = self.proxy_var.get().strip()
         config["duckmail_api_key"] = self.api_key_var.get().strip()
         config["yyds_api_key"] = self.yyds_api_key_var.get().strip()
@@ -2149,9 +2223,11 @@ class GrokRegisterGUI:
         )
 
         # 启动线程
+        self.log(f"[*] 并发线程数: {concurrent_workers}")
+
         thread = threading.Thread(
             target=self.run_registration,
-            args=(count, config["enable_nsfw"]),
+            args=(count, config["enable_nsfw"], concurrent_workers),
             daemon=True,
         )
         thread.start()
@@ -2161,8 +2237,7 @@ class GrokRegisterGUI:
         self.is_running = False
         self.log("[!] 用户停止注册")
 
-    def run_registration(self, count, enable_nsfw):
-        global browser, page
+    def run_registration_sequential_legacy(self, count, enable_nsfw):
         stopped_early = False
 
         try:
@@ -2258,6 +2333,122 @@ class GrokRegisterGUI:
             self.log(
                 f"\n========== 本批注册{'已停止' if stopped else '完成'}: 成功 {self.success_count}, 失败 {self.fail_count} =========="
             )
+
+    def run_registration(self, count, enable_nsfw, concurrent_workers=1):
+        stopped_early = False
+        workers = max(1, min(int(concurrent_workers or 1), count))
+
+        try:
+            self.log(f"[*] 启动 {workers} 个并发注册任务")
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(
+                        self.run_registration_task, i + 1, count, enable_nsfw
+                    )
+                    for i in range(count)
+                ]
+
+                for future in as_completed(futures):
+                    try:
+                        status = future.result()
+                    except Exception as exc:
+                        with self.state_lock:
+                            self.fail_count += 1
+                        self.log(f"[-] 注册任务异常: {format_exception_for_log(exc)}")
+                        self.update_stats()
+                        continue
+
+                    if status == "stopped":
+                        stopped_early = True
+
+        except RegistrationCancelled as e:
+            stopped_early = True
+            self.log(f"[!] {str(e)}")
+        except Exception as e:
+            self.log(f"[!] 错误: {format_exception_for_log(e)}")
+
+        finally:
+            stopped = self.stop_requested or stopped_early
+            self.save_results(stopped=stopped)
+            self.is_running = False
+            self._set_running_ui_state(False, stopped=stopped)
+            self.log(
+                f"\n========== 本批注册{'已停止' if stopped else '完成'}: 成功 {self.success_count}, 失败 {self.fail_count} =========="
+            )
+
+    def run_registration_task(self, index, total, enable_nsfw):
+        if self.should_stop():
+            return "stopped"
+
+        prefix = f"[{index}/{total}]"
+
+        def task_log(message):
+            self.log(f"{prefix} {message}")
+
+        task_log("开始注册账号")
+
+        try:
+            start_browser()
+            task_log("浏览器已启动")
+
+            task_log("1. 打开注册页...")
+            open_signup_page(log_callback=task_log, cancel_callback=self.should_stop)
+
+            task_log("2. 填写邮箱...")
+            email, dev_token = fill_email_and_submit(
+                log_callback=task_log, cancel_callback=self.should_stop
+            )
+
+            task_log("3. 填写验证码...")
+            fill_code_and_submit(
+                email,
+                dev_token,
+                log_callback=task_log,
+                cancel_callback=self.should_stop,
+            )
+
+            task_log("4. 填写资料...")
+            profile = fill_profile_and_submit(
+                log_callback=task_log, cancel_callback=self.should_stop
+            )
+
+            task_log("5. 获取 sso cookie...")
+            sso = wait_for_sso_cookie(
+                log_callback=task_log,
+                cancel_callback=self.should_stop,
+            )
+
+            result = {
+                "email": email,
+                "sso": sso,
+                "password": profile["password"],
+                "given_name": profile["given_name"],
+                "family_name": profile["family_name"],
+            }
+
+            if enable_nsfw:
+                task_log("正在开启 NSFW...")
+                success, msg = enable_nsfw_for_token(sso, log_callback=task_log)
+                task_log(f"[+] {msg}" if success else f"[-] {msg}")
+
+            with self.state_lock:
+                self.results.append(result)
+                self.success_count += 1
+            self.update_stats()
+            task_log(f"[+] 注册成功: {email}")
+            return "success"
+
+        except RegistrationCancelled as e:
+            task_log(f"[!] {str(e)}")
+            return "stopped"
+        except Exception as e:
+            with self.state_lock:
+                self.fail_count += 1
+            self.update_stats()
+            task_log(f"[-] 注册失败: {format_exception_for_log(e)}")
+            return "failed"
+        finally:
+            stop_browser()
 
     def save_results(self, stopped=False):
         if not self.results:
