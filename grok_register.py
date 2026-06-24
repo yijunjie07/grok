@@ -26,6 +26,78 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
+import atexit
+import tempfile
+import shutil
+import stat
+
+_all_browsers = set()
+_all_browsers_lock = threading.Lock()
+
+def register_browser(browser_obj):
+    with _all_browsers_lock:
+        _all_browsers.add(browser_obj)
+
+def unregister_browser(browser_obj):
+    with _all_browsers_lock:
+        _all_browsers.discard(browser_obj)
+
+def quit_all_browsers():
+    with _all_browsers_lock:
+        browsers = list(_all_browsers)
+    for b in browsers:
+        try:
+            b.quit()
+        except Exception:
+            pass
+    with _all_browsers_lock:
+        _all_browsers.clear()
+
+def clean_drissionpage_temp_dir():
+    dp_temp = os.path.join(tempfile.gettempdir(), 'DrissionPage')
+    if not os.path.exists(dp_temp):
+        return
+    def remove_readonly(func, path, excinfo):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except Exception:
+            pass
+    try:
+        for entry in os.scandir(dp_temp):
+            if entry.is_dir():
+                if entry.name == 'autoPortData' or entry.name.isdigit():
+                    if entry.name == 'autoPortData':
+                        try:
+                            for sub_entry in os.scandir(entry.path):
+                                if sub_entry.is_dir():
+                                    try:
+                                        shutil.rmtree(sub_entry.path, onerror=remove_readonly)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            shutil.rmtree(entry.path, onerror=remove_readonly)
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
+def async_clean_temp_dir():
+    time.sleep(3)
+    clean_drissionpage_temp_dir()
+
+def start_async_clean():
+    t = threading.Thread(target=async_clean_temp_dir, daemon=True)
+    t.start()
+
+def _on_system_exit():
+    quit_all_browsers()
+    clean_drissionpage_temp_dir()
+
+atexit.register(_on_system_exit)
 
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -945,6 +1017,7 @@ def set_thread_browser(browser_obj=None, page_obj=None):
 
 def start_browser():
     browser_obj = Chromium(build_chromium_options())
+    register_browser(browser_obj)
     tabs = browser_obj.get_tabs()
     page_obj = tabs[-1] if tabs else browser_obj.new_tab()
     set_thread_browser(browser_obj, page_obj)
@@ -958,6 +1031,8 @@ def stop_browser():
             browser_obj.quit()
         except Exception:
             pass
+        finally:
+            unregister_browser(browser_obj)
     set_thread_browser(None, None)
 
 
@@ -968,7 +1043,10 @@ def restart_browser():
             browser_obj.quit()
         except Exception:
             pass
+        finally:
+            unregister_browser(browser_obj)
     browser_obj = Chromium(build_chromium_options())
+    register_browser(browser_obj)
     tabs = browser_obj.get_tabs()
     page_obj = tabs[-1] if tabs else browser_obj.new_tab()
     set_thread_browser(browser_obj, page_obj)
@@ -1911,6 +1989,13 @@ class GrokRegisterGUI:
         self.state_lock = threading.Lock()
 
         self.setup_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def on_closing(self):
+        self.stop_requested = True
+        self.is_running = False
+        quit_all_browsers()
+        self.root.destroy()
 
     def setup_ui(self):
         load_config()
@@ -2481,6 +2566,7 @@ class GrokRegisterGUI:
 
 
 def main():
+    start_async_clean()
     root = tk.Tk()
     app = GrokRegisterGUI(root)
     root.mainloop()
